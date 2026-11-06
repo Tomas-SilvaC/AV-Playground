@@ -1,0 +1,1 @@
+C:\zmb\Scripts\python ZomboidNormalMapper.py
