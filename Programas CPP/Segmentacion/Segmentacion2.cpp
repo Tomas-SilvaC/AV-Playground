@@ -1,16 +1,45 @@
-// Vision Artificial - Segmentacion con ideas de ViT y CNN (OpenCV + C++)
-//
-// Implementa, sin pesos entrenados, las etapas descritas en la presentacion:
-//   CNN  : convolucion -> ReLU -> max-pooling (mapas de caracteristicas)
-//   ViT  : 1) fragmentacion en parches y aplanamiento
-//          2) embedding lineal (proyeccion aleatoria fija)
-//          3) codificacion posicional sinusoidal
-//          4) token CLS
-//          5) autoatencion  softmax(QK^T / T) V   (Q=K=V, una sola cabeza)
-//   Segmentacion: k-means sobre los tokens contextualizados -> mascara por parche
-//
-// Uso: vit_seg imagen.jpg [parche=16] [k=4] [--show]
-//      o sin argumentos: el programa pide la ruta por consola
+/**
+ * Segmentacion2.cpp
+ * Segmentación con ideas de CNN y Vision Transformer (ViT), sin pesos entrenados.
+ *
+ * ## Idea general
+ * Este programa reproduce, de forma didáctica y sin entrenamiento, las etapas
+ * fundamentales de dos arquitecturas de visión:
+ *
+ * ### CNN (red neuronal convolucional)
+ *   convolución -> ReLU -> max-pooling
+ *   - La convolución aplica filtros (aquí kernels clásicos: Sobel X/Y, Laplaciano y
+ *     Gauss) para extraer características locales (bordes, suavizado).
+ *   - ReLU descarta las respuestas negativas (no linealidad).
+ *   - El max-pooling reduce la resolución a la mitad quedándose con el máximo de
+ *     cada bloque 2x2, conservando los rasgos más destacados.
+ *   En una CNN real los kernels se aprenden; aquí se fijan a mano.
+ *
+ * ### ViT (Vision Transformer)
+ *   1) Fragmentación: la imagen se divide en parches PxP sin solaparse y cada uno
+ *      se aplana a un vector (tokens, análogos a las palabras en NLP).
+ *   2) Embedding lineal: cada vector se proyecta a dimensión D. Aquí la matriz de
+ *      proyección es aleatoria y fija (en un ViT real es aprendida).
+ *   3) Codificación posicional: se suma información de posición (sinusoidal), porque
+ *      la atención por sí sola no conoce el orden espacial de los parches.
+ *   4) Token CLS: token extra que resume la imagen completa (aquí, la media de los
+ *      parches; en un ViT real es un vector aprendible).
+ *   5) Autoatención de una cabeza: softmax(Q K^T / T) V con Q = K = V. Cada token se
+ *      relaciona con todos los demás, capturando contexto global desde la primera
+ *      capa (a diferencia de la convolución, que es local). T actúa de temperatura.
+ *
+ * ### Segmentación
+ *   Con los tokens ya contextualizados se agrupan con k-means (k grupos): parches
+ *   parecidos reciben la misma etiqueta, y la etiqueta se pinta como máscara sobre
+ *   la imagen. Es una segmentación a nivel de parche (no de píxel).
+ *
+ * ## Uso
+ *   vit_seg imagen.jpg [parche=16] [k=4] [--show]
+ *   o sin argumentos: el programa pide la ruta por consola
+ *
+ * ## Salidas
+ *   out_panel_vit.png, out_segmentacion.png, out_atencion.png, out_cnn_features.png
+ */
 
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -26,6 +55,9 @@ static const float TEMP     = 0.05f; // temperatura del softmax (sobre coseno)
 static const float PE_SCALE = 0.3f;  // peso de la codificacion posicional
 
 // ---------- CNN: convolucion + ReLU + max pooling ----------
+// Max-pooling 2x2 con paso 2: cada bloque de 2x2 píxeles se reemplaza por su valor
+// máximo, reduciendo ancho y alto a la mitad. Entrada y salida son CV_32F.
+
 static Mat maxPool2x2(const Mat& src) {
     Mat dst(src.rows / 2, src.cols / 2, CV_32F);
     for (int y = 0; y < dst.rows; ++y)
@@ -38,6 +70,12 @@ static Mat maxPool2x2(const Mat& src) {
         }
     return dst;
 }
+
+// Aplica una "capa CNN" fija con 4 filtros (Sobel X, Sobel Y, Laplaciano, Gauss 5x5)
+// y devuelve un mosaico 2x2 con los mapas de características resultantes.
+// Por cada filtro: convolución (filter2D) -> ReLU -> max-pooling -> normalizar para
+// visualizar -> reescalar a IMG_SIZE x IMG_SIZE.
+// @param bgr  Imagen de entrada (ya redimensionada a IMG_SIZE).
 
 static Mat cnnFeatureMaps(const Mat& bgr) {
     Mat gray, g32;
@@ -76,6 +114,11 @@ static Mat cnnFeatureMaps(const Mat& bgr) {
 }
 
 // ---------- ViT: parches, embedding, posicion, CLS, autoatencion ----------
+// Paso 1 del ViT: divide la imagen en parches PxP sin solaparse y aplana cada uno
+// (P x P x 3 canales) en un vector fila de longitud P*P*3.
+// @param img  Imagen cuadrada IMG_SIZE x IMG_SIZE en BGR.
+// @param P    Tamaño del parche (debe dividir a IMG_SIZE).
+// @return     Matriz N x (P*P*3), con N = (IMG_SIZE/P)^2 tokens, en orden fila a fila.
 static Mat flattenPatches(const Mat& img, int P) {
     int g = img.rows / P, N = g * g, len = P * P * 3;
     Mat tokens(N, len, CV_32F);
@@ -88,6 +131,13 @@ static Mat flattenPatches(const Mat& img, int P) {
     return tokens;
 }
 
+// Paso 3 del ViT: codificación posicional sinusoidal.
+// Para la posición 'pos' y la dimensión i: seno si i es par, coseno si es impar,
+// con frecuencias decrecientes según 10000^(2*(i/2)/D). Cada posición obtiene así
+// un patrón único que el modelo puede usar para saber dónde estaba cada parche.
+// @param N  Número de posiciones (tokens).
+// @param D  Dimensión del embedding.
+
 static Mat positionalEncoding(int N, int D) {
     Mat pe(N, D, CV_32F);
     for (int pos = 0; pos < N; ++pos)
@@ -98,12 +148,18 @@ static Mat positionalEncoding(int N, int D) {
     return pe;
 }
 
+// Normaliza cada fila a norma L2 = 1. Así el producto punto entre dos filas es su
+// similitud coseno, que es lo que se usa como puntuación de atención.
+
 static void l2NormalizeRows(Mat& m) {
     for (int r = 0; r < m.rows; ++r) {
         double n = norm(m.row(r));
         if (n > 1e-9) m.row(r) /= n;
     }
 }
+
+// Softmax por filas (estable numéricamente: se resta el máximo de cada fila antes
+// de exponenciar). Convierte cada fila en una distribución de probabilidad.
 
 static void softmaxRows(Mat& m) {
     for (int r = 0; r < m.rows; ++r) {
@@ -141,6 +197,7 @@ int main(int argc, char** argv) {
             else if (pos == 1) { K = stoi(s); ++pos; }
         }
     }
+    // La imagen debe poder dividirse exactamente en parches PxP.
     if (IMG_SIZE % P != 0) { cerr << "El parche debe dividir " << IMG_SIZE << "\n"; return 1; }
 
     Mat src = imread(path);
@@ -161,6 +218,7 @@ int main(int argc, char** argv) {
     }
 
     // 2) Embedding lineal: proyeccion aleatoria fija W (P*P*3 x D)
+    //    Semilla fija (42) para que los resultados sean reproducibles.
     RNG rng(42);
     Mat W(tokens.cols, EMB_DIM, CV_32F);
     rng.fill(W, RNG::NORMAL, 0.0, 1.0 / sqrt((double)tokens.cols));
@@ -170,20 +228,23 @@ int main(int argc, char** argv) {
     Mat X = tokCentered * W;                       // N x D
     l2NormalizeRows(X);
 
-    // 3) Codificacion posicional sinusoidal
+    // 3) Codificacion posicional sinusoidal (sumada, con peso PE_SCALE)
     X += PE_SCALE * positionalEncoding(N, EMB_DIM) / sqrt((float)EMB_DIM);
 
     // 4) Token CLS (media de los parches; en un ViT real es aprendible)
+    //    Se antepone como fila 0: la secuencia pasa a tener N+1 tokens.
     Mat cls; reduce(X, cls, 0, REDUCE_AVG);
     Mat Xc; vconcat(cls, X, Xc);                   // (N+1) x D
     l2NormalizeRows(Xc);
 
     // 5) Autoatencion de una cabeza: softmax(Q K^T / T) V con Q=K=V=Xc
+    //    scores(i, j) = cuánto "atiende" el token i al token j.
     Mat scores = (Xc * Xc.t()) / TEMP;
     softmaxRows(scores);
     Mat Y = scores * Xc;                           // tokens contextualizados
 
-    // Mapa de atencion del CLS hacia cada parche
+    // Mapa de atencion del CLS hacia cada parche (fila 0, columnas 1..N)
+    // se muestra como mapa de calor superpuesto a la imagen.
     Mat attn(g, g, CV_32F);
     for (int i = 0; i < N; ++i) attn.at<float>(i / g, i % g) = scores.at<float>(0, i + 1);
     normalize(attn, attn, 0, 255, NORM_MINMAX);
@@ -194,12 +255,15 @@ int main(int argc, char** argv) {
     Mat attnOverlay; addWeighted(img, 0.5, heat, 0.5, 0, attnOverlay);
 
     // 6) Segmentacion: k-means sobre los tokens (sin CLS)
+    //    Parches con características contextualizadas similares quedan en el mismo grupo.
     Mat feats = Y.rowRange(1, N + 1).clone();
     Mat labels, centers;
     kmeans(feats, K, labels,
            TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 100, 1e-4),
            5, KMEANS_PP_CENTERS, centers);
 
+    // Mapa de etiquetas (g x g) escalado a [0,255] y ampliado con vecino más cercano
+    // para conservar los bloques nítidos; luego se colorea y se mezcla con la imagen.
     Mat labelMap(g, g, CV_8U);
     for (int i = 0; i < N; ++i)
         labelMap.at<uchar>(i / g, i % g) = (uchar)(labels.at<int>(i) * (255 / max(1, K - 1)));
@@ -212,6 +276,8 @@ int main(int argc, char** argv) {
     Mat cnn = cnnFeatureMaps(img);
 
     // Salidas
+    // Escribe el texto dos veces (borde negro grueso + relleno blanco) para que
+    // sea legible sobre cualquier fondo.
     auto label = [](Mat m, const string& t) {
         putText(m, t, Point(6, 18), FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0,0,0), 3, LINE_AA);
         putText(m, t, Point(6, 18), FONT_HERSHEY_SIMPLEX, 0.55, Scalar(255,255,255), 1, LINE_AA);

@@ -1,18 +1,48 @@
-#include <opencv2/core/version.hpp>
+/**
+ * CameraCalib.cpp
+ * Calibración de cámara con tablero de ajedrez y corrección de distorsión en vivo.
+ *
+ * Toda lente deforma la imagen. Calibrar la cámara es estimar matemáticamente esa
+ * deformación para poder corregirla por software. Se obtienen:
+ *
+ *   - Matriz intrínseca K (3x3): distancia focal (fx, fy, en píxeles) y punto
+ *     principal (cx, cy). Modela una cámara estenopeica (pinhole) ideal y es única
+ *     para cada combinación cámara + lente + resolución.
+ *   - Coeficientes de distorsión D: radial (k1, k2, k3: barril o cojín) y
+ *     tangencial (p1, p2: lente no paralela al sensor). El modelo estándar usa 5.
+ *     (Para lentes ojo de pez extremas se debe usar el módulo cv::fisheye, que
+ *     emplea otro modelo de proyección.)
+ *   - Extrínsecos por imagen: vectores de rotación (rvecs) y traslación (tvecs) del
+ *     tablero respecto a la cámara.
+ *
+ * ## Procedimiento
+ *   1. Definir las coordenadas 3D del tablero (plano, Z = 0), en "unidades de casilla".
+ *   2. Para cada foto: detectar las esquinas interiores y refinarlas a precisión subpíxel.
+ *   3. cv::calibrateCamera relaciona los puntos 3D con los 2D detectados y devuelve
+ *      K, D, rvecs, tvecs y el error RMS de reproyección (cuanto menor, mejor;
+ *      valores < 1 px suelen considerarse buenos).
+ *   4. Guardar los resultados en calibration.yml.
+ *   5. Usarlos en vivo: construir los mapas de corrección una sola vez y aplicar
+ *      cv::remap en cada fotograma de la cámara.
+ *
+ * Importante: CHECKERBOARD cuenta ESQUINAS INTERIORES, no casillas. Un tablero de
+ * 6x9 casillas tiene 5x8 esquinas interiores. Para una buena calibración conviene
+ * usar ~15-25 fotos con el tablero en distintas posiciones, ángulos y zonas del
+ * encuadre (cobertura > cantidad).
+ *
+ * ## Entrada
+ *   ./images/*.jpg   fotos del tablero, junto al ejecutable (o al .vcxproj).
+ */
 
-// Always need these for basic image I/O, color conversion, and display
+#include <opencv2/core/version.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/core/utils/filesystem.hpp>
-
 #if CV_VERSION_MAJOR >= 5
 #include <opencv2/calib.hpp>
 #include <opencv2/objdetect.hpp>
-// NOTE: verify this path against your actual OpenCV 5 install
-// (check <opencv_install_dir>/include/opencv2/ for the real file/folder name).
-// Some sources list it as opencv2/geometry/3d.hpp, others as opencv2/3d.hpp.
 #include <opencv2/geometry/3d.hpp>
 #else
 #include <opencv2/calib3d.hpp>
@@ -29,12 +59,14 @@ int CHECKERBOARD[2]{ 5, 8 };
 
 int main()
 {
-    // Vector to store vectors of 3D points for each checkerboard image
+    // Puntos 3D del mundo real, uno vector por imagen
     std::vector<std::vector<cv::Point3f>> objpoints;
-    // Vector to store vectors of 2D points for each checkerboard image
+    // Puntos 2D (píxeles) detectados, un vector por imagen
     std::vector<std::vector<cv::Point2f>> imgpoints;
 
-    // Defining the world coordinates for 3D points
+    // Coordenadas 3D de las esquinas del tablero: (0,0,0), (1,0,0), ... con Z = 0
+    // porque el tablero es plano. Las unidades son "casillas"; si se usara el
+    // tamaño real de la casilla (p. ej. 25 mm), los tvecs saldrían en mm.
     std::vector<cv::Point3f> objp;
     for (int i{ 0 }; i < CHECKERBOARD[1]; i++)
     {
@@ -42,9 +74,8 @@ int main()
             objp.push_back(cv::Point3f(j, i, 0));
     }
 
-    // Extracting path of individual image stored in a given directory
+    // Listar todas las imágenes de calibración de la carpeta
     std::vector<cv::String> images;
-    // Path of the folder containing checkerboard images
     std::string path = "./images/*.jpg";
     cv::glob(path, images);
 
@@ -58,11 +89,11 @@ int main()
     }
 
     cv::Mat frame, gray;
-    // Vector to store the pixel coordinates of detected checkerboard corners
+    // Coordenadas en píxeles de las esquinas detectadas en la imagen actual
     std::vector<cv::Point2f> corner_pts;
     bool success;
 
-    // Looping over all the images in the directory
+    // Recorrer todas las imágenes
     for (size_t i{ 0 }; i < images.size(); i++)
     {
         frame = cv::imread(images[i]);
@@ -71,10 +102,12 @@ int main()
             std::cerr << "Could not read image: " << images[i] << std::endl;
             continue;
         }
-
+        // La detección de esquinas trabaja sobre intensidades
         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-
-        // Finding checkerboard corners
+        //  Buscar las esquinas interiores del tablero.
+        //  ADAPTIVE_THRESH : binariza con umbral adaptativo (robusto a iluminación irregular)
+        //  FAST_CHECK      : descarte rápido si claramente no hay tablero
+        //  NORMALIZE_IMAGE : ecualiza el contraste antes de binarizar
         success = cv::findChessboardCorners(
             gray,
             cv::Size(CHECKERBOARD[0], CHECKERBOARD[1]),
@@ -82,21 +115,21 @@ int main()
             cv::CALIB_CB_ADAPTIVE_THRESH | cv::CALIB_CB_FAST_CHECK | cv::CALIB_CB_NORMALIZE_IMAGE);
 
         if (success)
-        {
+        {   // Criterio de parada del refinamiento: 30 iteraciones o cambio < 0.001 px
             cv::TermCriteria criteria(cv::TermCriteria::EPS | cv::TermCriteria::MAX_ITER, 30, 0.001);
 
-            // Refining pixel coordinates for given 2D points
+            // Refinar a precisión subpíxel (ventana de búsqueda de 11x11)
             cv::cornerSubPix(gray, corner_pts, cv::Size(11, 11), cv::Size(-1, -1), criteria);
 
-            // Displaying the detected corner points on the checkerboard
+            // Dibujar las esquinas detectadas sobre la imagen para inspección visual
             cv::drawChessboardCorners(frame, cv::Size(CHECKERBOARD[0], CHECKERBOARD[1]), corner_pts, success);
-
+            // Solo las imágenes con detección exitosa aportan a la calibración
             objpoints.push_back(objp);
             imgpoints.push_back(corner_pts);
         }
 
         cv::imshow("Image", frame);
-        cv::waitKey(0);
+        cv::waitKey(0); // pasar a la siguiente imagen con cualquier tecla
     }
 
     cv::destroyAllWindows();
@@ -109,15 +142,14 @@ int main()
     }
 
     cv::Mat cameraMatrix, distCoeffs;
-    // rvecs/tvecs must be vectors -- one rotation & translation vector per image,
-    // not a single cv::Mat
+    // rvecs/tvecs deben ser vectores: un vector de rotación y uno de traslación
+    // por cada imagen (no una única cv::Mat)
     std::vector<cv::Mat> rvecs, tvecs;
-
-    /*
-     * Performing camera calibration by passing the value of known 3D points
-     * (objpoints) and corresponding pixel coordinates of the detected
-     * corners (imgpoints)
-     */
+    
+    // Calibración: a partir de los puntos 3D conocidos (objpoints) y sus
+    // correspondencias en píxeles (imgpoints), optimiza K, D y la pose del
+    // tablero en cada foto minimizando el error de reproyección.
+    // Devuelve el error RMS de reproyección en píxeles.
     double rms = cv::calibrateCamera(objpoints, imgpoints, gray.size(), cameraMatrix, distCoeffs, rvecs, tvecs);
 
     std::cout << "RMS re-projection error : " << rms << std::endl;
@@ -152,7 +184,7 @@ int main()
 #endif
 
     std::strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &timeInfo);
-
+    // Se guarda también la resolución: K y D solo son válidos para ella.
     fs << "calibration_date" << timeBuf;
     fs << "image_width" << gray.cols;
     fs << "image_height" << gray.rows;
@@ -183,10 +215,9 @@ int main()
         return -1;
     }
 
-    // Intentar que la camara capture al mismo tamano que las imagenes de
+    // Intentar que la camara capture al mismo tamaño que las imagenes de
     // calibracion, porque cameraMatrix/distCoeffs son validos para esa
-    // resolucion. Algunos drivers ignoran este set(); si tu camara no
-    // respeta este tamano, lo ideal es recalibrar con esa resolucion.
+    // resolucion. Algunos drivers ignoran este set();
     cap.set(cv::CAP_PROP_FRAME_WIDTH, gray.cols);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, gray.rows);
 
@@ -201,11 +232,14 @@ int main()
             << ". La correccion puede no ser exacta." << std::endl;
     }
 
-    // Precalcular los mapas de undistorsion una sola vez (mucho mas
-    // eficiente que llamar a cv::undistort en cada frame)
+    // Precalcular los mapas de undistorsion una sola vez (mas
+    // eficiente que llamar a cv::undistort en cada frame).
+    // alpha = 1 en getOptimalNewCameraMatrix conserva todos los píxeles de la
+    // imagen original (puede dejar bordes negros tras corregir la distorsión).
     cv::Mat newCameraMatrix = cv::getOptimalNewCameraMatrix(
         cameraMatrix, distCoeffs, imageSize, 1, imageSize);
-
+    // Cada píxel destino guarda en map1/map2 de qué posición de la imagen
+    // distorsionada debe leer su valor.
     cv::Mat map1, map2;
     cv::initUndistortRectifyMap(
         cameraMatrix, distCoeffs, cv::Mat(), newCameraMatrix,
@@ -226,6 +260,7 @@ int main()
             break;
         }
 
+        // Corregir la distorsión aplicando los mapas precalculados
         cv::remap(liveFrame, undistorted, map1, map2, cv::INTER_LINEAR);
 
         // Detectar y pintar las esquinas del tablero sobre la imagen original
@@ -245,7 +280,9 @@ int main()
             cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0,
             foundLive ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 2);
 
-        // Detectar y pintar las esquinas del tablero sobre la imagen ya corregida
+        // Detectar y pintar las esquinas del tablero sobre la imagen ya corregida.
+        // Comparar ambas vistas permite verificar visualmente que las líneas rectas
+        // del tablero si quedan rectas tras la corrección.
         cv::cvtColor(undistorted, undistortedGray, cv::COLOR_BGR2GRAY);
         std::vector<cv::Point2f> undistortedCorners;
         bool foundUndistorted = cv::findChessboardCorners(
@@ -264,10 +301,10 @@ int main()
         cv::imshow("Corregido (undistorted)", undistorted);
 
         int key = cv::waitKey(1);
-        if (key == 'q' || key == 27) // 27 = tecla ESC
+        if (key == 'q' || key == 27) // 27 = tecla ESC para parar el programa
             break;
     }
-
+    // Liberar siempre la cámara para evitar bloquearla
     cap.release();
     cv::destroyAllWindows();
 

@@ -12,6 +12,31 @@ teclado, deshacer/rehacer y tema oscuro.
 
 Requisitos:  pip install PySide6 opencv-python numpy
 Ejecutar:    python ZomboidNormalMapper.py
+
+=============================================================================
+CONCEPTOS DE VISION ARTIFICIAL QUE USA ESTE PROGRAMA
+=============================================================================
+* Transformacion de perspectiva (homografia): 4 puntos de origen -> 4 esquinas de
+  un rectangulo. cv2.getPerspectiveTransform calcula la matriz 3x3 y
+  cv2.warpPerspective la aplica (coordenadas homogeneas; la division por w es lo
+  que produce el efecto de perspectiva). Endereza una pared dibujada en isometrico.
+* Mapa de normales: cada pixel guarda un vector normal (x, y, z) codificado como
+  color (v * 127.5 + 127.5). Aqui el relieve se simula usando la luminosidad como
+  mapa de alturas y midiendo su pendiente con filtros espaciales:
+    - GaussianBlur : filtro paso bajo para quitar ruido del pixel art.
+    - Sobel        : convolucion 3x3 que estima el gradiente en X e Y (bordes).
+    - CLAHE        : ecualizacion adaptativa de histograma con limite de contraste.
+* Umbralizacion: el canal alfa se binariza (>= 128) para separar objeto y fondo.
+* Modelo de iluminacion difusa (Lambert): brillo ~ max(0, N . L), usado en la
+  vista "Luz" para comprobar el relieve.
+
+Estructura del archivo:
+  1. Constantes y utilidades de recursos.
+  2. Logica de imagen pura (sin interfaz).
+  3. Utilidades de vista (conversion a QImage, tema).
+  4. ImageView: widget de imagen con zoom, pan, puntos arrastrables y comparacion.
+  5. SliderConValor: control auxiliar.
+  6. Ventana: ventana principal (UI, estado, deshacer, presets, guardado).
 """
 
 import json
@@ -39,6 +64,7 @@ DEFAULT_SRC = [(60, 2), (123, 33), (60, 194), (123, 225)]  # TL, TR, BL, BR
 DEFAULT_SIZE = (128, 256)  # ancho, alto de salida
 POINT_NAMES = ["Arriba-izquierda", "Arriba-derecha", "Abajo-izquierda", "Abajo-derecha"]
 
+# Estado completo que se guarda/restaura (deshacer, presets, sesion anterior).
 DEFAULT_ESTADO = {
     "warp": True,
     "puntos": [list(p) for p in DEFAULT_SRC],
@@ -52,11 +78,16 @@ DEFAULT_ESTADO = {
     "directx": False,
     "fondo_plano": False,
 }
+# Claves que pertenecen al grupo "normales" (para restaurar o aplicar presets parciales).
 CLAVES_NORMALES = ["strength", "blur", "contraste", "invertir", "directx", "fondo_plano"]
 
 
 def ruta_recurso(nombre):
-    """Ruta de un archivo junto al script (o dentro del .exe de PyInstaller)."""
+    """Devuelve la ruta de un archivo junto al script (o dentro del .exe de PyInstaller).
+
+    PyInstaller descomprime los recursos en sys._MEIPASS; si no existe, se usa la
+    carpeta del propio script.
+    """
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, nombre)
 
@@ -65,7 +96,16 @@ def ruta_recurso(nombre):
 # Logica de imagen (sin interfaz, reutilizable)
 # ----------------------------------------------------------------------------
 def leer_imagen(ruta):
-    """Lee una imagen (soporta rutas unicode en Windows) y la devuelve en BGRA."""
+    """Lee una imagen (soporta rutas unicode en Windows) y la devuelve en BGRA.
+
+    Se usa np.fromfile + imdecode porque cv2.imread falla con rutas no ASCII en
+    Windows. IMREAD_UNCHANGED conserva el canal alfa. Si la imagen no es de 8 bits
+    (p. ej. 16 bits) se normaliza a [0, 255]; las imagenes de 1 o 3 canales se
+    convierten a 4 para trabajar siempre con el mismo formato.
+
+    Raises:
+        ValueError: si el archivo no se puede decodificar como imagen.
+    """
     datos = np.fromfile(ruta, dtype=np.uint8)
     img = cv2.imdecode(datos, cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -80,7 +120,10 @@ def leer_imagen(ruta):
 
 
 def guardar_imagen(ruta, img):
-    """Guarda una imagen PNG (soporta rutas unicode). Lanza excepcion si falla."""
+    """Guarda una imagen PNG (soporta rutas unicode). Lanza excepcion si falla.
+
+    Usa imencode + tofile por la misma razon que leer_imagen (rutas unicode).
+    """
     ok, buf = cv2.imencode(".png", img)
     if not ok:
         raise IOError("No se pudo codificar la imagen")
@@ -89,7 +132,14 @@ def guardar_imagen(ruta, img):
 
 def tamano_auto(puntos):
     """Tamano en pixeles del area marcada por los 4 puntos (TL, TR, BL, BR).
-    Ancho = promedio de los bordes superior e inferior; alto = promedio de izquierdo y derecho."""
+
+    Ancho = promedio de los bordes superior e inferior; alto = promedio de los
+    bordes izquierdo y derecho (distancias euclidianas). Asi la imagen enderezada
+    conserva aproximadamente la resolucion original, sin estirarse ni encogerse.
+
+    Returns:
+        (ancho, alto) en pixeles, minimo 1.
+    """
     (tl, tr, bl, br) = [np.array(p, dtype=np.float64) for p in puntos]
     ancho = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
     alto = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
@@ -97,7 +147,16 @@ def tamano_auto(puntos):
 
 
 def aplicar_warp(img_bgra, src_pts, size):
-    """Warp de perspectiva: los 4 puntos de origen pasan a las esquinas de un rectangulo."""
+    """Warp de perspectiva: los 4 puntos de origen pasan a las esquinas de un rectangulo.
+
+    Args:
+        img_bgra: imagen de entrada (BGRA).
+        src_pts:  4 puntos (x, y) en orden TL, TR, BL, BR.
+        size:     (ancho, alto) del rectangulo de salida.
+
+    Calcula la homografia 3x3 con getPerspectiveTransform y la aplica con
+    warpPerspective (interpolacion bilineal por defecto).
+    """
     w, h = size
     src = np.array(src_pts, dtype=np.float32)
     dst = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=np.float32)
@@ -108,34 +167,60 @@ def aplicar_warp(img_bgra, src_pts, size):
 def crear_mapa_normales(bgra, strength, blur_radius, invert, flip_green,
                         contrast_clip, fondo_plano):
     """Devuelve un mapa de normales BGRA a partir de una imagen BGRA.
-    El canal alfa de la entrada se conserva tal cual (incluidos los semitransparentes)."""
+
+    El canal alfa de la entrada se conserva tal cual (incluidos los semitransparentes).
+
+    Pipeline:
+        gris -> (inversion) -> relleno del fondo con la media -> CLAHE (opcional)
+        -> alturas en [0,1] -> Gaussiano (opcional) -> Sobel dx, dy
+        -> normal (nx, ny, nz) normalizada -> codificacion a color.
+
+    Args:
+        bgra:          imagen ya warpeada (BGRA).
+        strength:      intensidad del relieve (multiplica el gradiente).
+        blur_radius:   radio del Gaussiano previo (kernel = 2*radio + 1); 0 = sin blur.
+        invert:        invierte claros/oscuros (oscuro = alto).
+        flip_green:    True = formato DirectX (canal verde invertido); False = OpenGL.
+        contrast_clip: limite de CLAHE; 0 = apagado.
+        fondo_plano:   True = el fondo transparente conserva normal plana;
+                       False = el fondo totalmente transparente queda negro.
+    """
     bgr = bgra[:, :, :3]
     alpha = bgra[:, :, 3]
 
+    # La luminosidad hace de mapa de alturas.
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     if invert:
         gray = cv2.bitwise_not(gray)
 
+    # Umbralizacion del alfa: >= 128 es objeto. El fondo se rellena con la altura
+    # media del objeto para que el contorno del sprite no genere un relieve falso.
     mask = (alpha >= 128).astype(np.uint8) * 255
     mask_inv = cv2.bitwise_not(mask)
     media = cv2.mean(gray, mask=mask)[0] if cv2.countNonZero(mask) > 0 else 128
     gray[mask_inv > 0] = int(round(media))
 
+    # CLAHE: ecualizacion adaptativa de histograma por regiones (tiles de 4x4).
     if contrast_clip > 0:
         clahe = cv2.createCLAHE(clipLimit=contrast_clip, tileGridSize=(4, 4))
         gray = clahe.apply(gray)
 
     height = gray.astype(np.float32) / 255.0
 
+    # Suavizado paso bajo: reduce el ruido del pixel art.
     if blur_radius > 0:
         k = blur_radius * 2 + 1
         height = cv2.GaussianBlur(height, (k, k), 0)
 
+    # Gradientes con Sobel 3x3. scale = 1/8 normaliza el kernel (pesos que suman 8)
+    # para obtener la pendiente real; BORDER_REPLICATE evita falsos bordes.
     dx = cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3, scale=1.0 / 8.0,
                    borderType=cv2.BORDER_REPLICATE)
     dy = cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3, scale=1.0 / 8.0,
                    borderType=cv2.BORDER_REPLICATE)
 
+    # Vector normal n = (-s*dx, +-s*dy, 1) / |n|. En imagen Y crece hacia abajo,
+    # por eso el signo de ny depende del formato (OpenGL vs DirectX).
     nx = dx * (-strength)
     ny = dy * (-strength if flip_green else strength)
     nz = np.ones_like(height)
@@ -143,9 +228,10 @@ def crear_mapa_normales(bgra, strength, blur_radius, invert, flip_green,
     nx, ny, nz = nx / length, ny / length, nz / length
 
     def a8(v):
+        """Codifica [-1, 1] -> [0, 255] (v * 127.5 + 127.5)."""
         return np.clip(v * 127.5 + 127.5, 0, 255).astype(np.uint8)
 
-    normal = np.dstack([a8(nz), a8(ny), a8(nx)])  # BGR
+    normal = np.dstack([a8(nz), a8(ny), a8(nx)])  # BGR: B = z, G = y, R = x
     normal[mask_inv > 0] = (255, 128, 128)        # normal plana fuera del objeto
     if not fondo_plano:
         normal[alpha == 0] = (0, 0, 0)
@@ -154,9 +240,22 @@ def crear_mapa_normales(bgra, strength, blur_radius, invert, flip_green,
 
 
 def iluminar(warp, normal, flip_green, luz_xy, luz_z):
-    """Previsualiza el relieve con una luz puntual en luz_xy (coordenadas de imagen)."""
+    """Previsualiza el relieve con una luz puntual en luz_xy (coordenadas de imagen).
+
+    Modelo de iluminacion difusa (Lambert): para cada pixel se calcula el vector
+    hacia la luz L y se usa el producto punto N . L (recortado a [0, 1]) como
+    factor de brillo, con un minimo ambiental de 0.30.
+
+    Args:
+        warp:       imagen warpeada (BGRA), da el color base.
+        normal:     mapa de normales (BGRA).
+        flip_green: si el mapa esta en formato DirectX, se invierte ny al leerlo.
+        luz_xy:     posicion (x, y) de la luz en coordenadas de imagen.
+        luz_z:      altura de la luz sobre la imagen (mas alta = luz mas uniforme).
+    """
     h, w = warp.shape[:2]
-    n = normal[:, :, 2::-1].astype(np.float32) / 127.5 - 1.0   # BGR -> (x, y, z)
+    # Decodificar el color a vector normal: BGR -> (x, y, z) en [-1, 1].
+    n = normal[:, :, 2::-1].astype(np.float32) / 127.5 - 1.0
     nx, ny, nz = n[:, :, 0], n[:, :, 1], n[:, :, 2]
     if flip_green:
         ny = -ny
@@ -166,7 +265,7 @@ def iluminar(warp, normal, flip_green, luz_xy, luz_z):
     ly = (yy - luz_xy[1]) / escala          # +Y hacia arriba
     lz = np.full_like(lx, luz_z)
     ln = np.sqrt(lx * lx + ly * ly + lz * lz)
-    dif = np.clip((nx * lx + ny * ly + nz * lz) / ln, 0, 1)
+    dif = np.clip((nx * lx + ny * ly + nz * lz) / ln, 0, 1)   # N . L normalizado
     brillo = (0.30 + 0.90 * dif)[:, :, None]
     bgr = np.clip(warp[:, :, :3].astype(np.float32) * brillo, 0, 255).astype(np.uint8)
     return np.dstack([bgr, warp[:, :, 3]])
@@ -176,7 +275,11 @@ def iluminar(warp, normal, flip_green, luz_xy, luz_z):
 # Utilidades de vista
 # ----------------------------------------------------------------------------
 def bgra_a_qimage(img, solo_rgb=False):
-    """numpy BGR/BGRA -> QImage RGBA (con transparencia). solo_rgb ignora el alfa."""
+    """numpy BGR/BGRA -> QImage RGBA (con transparencia). solo_rgb ignora el alfa.
+
+    OpenCV usa orden BGR(A) y Qt espera RGBA, por eso se convierte. El .copy()
+    final desliga la QImage del buffer de numpy (que podria liberarse).
+    """
     if img.shape[2] == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
     rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
@@ -188,6 +291,7 @@ def bgra_a_qimage(img, solo_rgb=False):
 
 
 def aplicar_tema(app, oscuro):
+    """Aplica el tema oscuro (paleta Fusion personalizada) o el estandar claro."""
     app.setStyle("Fusion")
     if not oscuro:
         app.setPalette(app.style().standardPalette())
@@ -217,6 +321,21 @@ def aplicar_tema(app, oscuro):
 # Vista de imagen: zoom con rueda, mover, puntos arrastrables, comparacion
 # ----------------------------------------------------------------------------
 class ImageView(QWidget):
+    """Widget que muestra una imagen con zoom, desplazamiento y herramientas de edicion.
+
+    Funciones:
+      - Zoom con la rueda (centrado en el cursor) y desplazamiento arrastrando.
+      - Fondo configurable (cuadros de transparencia o color solido).
+      - Cuadrilatero con 4 puntos arrastrables (los puntos del warp), si 'puntos' esta definido.
+      - Modo comparacion: dos imagenes separadas por un divisor movible.
+
+    Maneja dos sistemas de coordenadas: imagen (pixeles de la imagen) y vista
+    (pixeles del widget); _i2v y _v2i convierten entre ambos usando zoom y offset.
+
+    Signals:
+        puntoMovido(indice, x, y): se arrastro un punto (coordenadas de imagen).
+        hoverImagen(x, y): posicion del mouse en coordenadas de imagen.
+    """
     puntoMovido = Signal(int, float, float)   # indice, x, y (coordenadas de imagen)
     hoverImagen = Signal(float, float)        # posicion del mouse en coordenadas de imagen
 
@@ -227,21 +346,22 @@ class ImageView(QWidget):
         super().__init__()
         self.setMinimumSize(240, 240)
         self.setMouseTracking(True)
-        self.mensaje = mensaje
+        self.mensaje = mensaje    # texto cuando no hay imagen
         self.img = None
-        self.img2 = None
+        self.img2 = None          # segunda imagen (modo comparacion)
         self.zoom = 1.0
-        self.off = QPointF(0, 0)
-        self.auto_fit = True
+        self.off = QPointF(0, 0)  # desplazamiento de la imagen en la vista
+        self.auto_fit = True      # True = ajustar al redimensionar la ventana
         self.fondo = "Cuadros"
         self.puntos = None        # lista de 4 (x, y) o None
         self.comparar = False
-        self.split = 0.5
-        self._drag = None
-        self._tile = None
+        self.split = 0.5          # posicion del divisor (0..1)
+        self._drag = None         # estado del arrastre actual
+        self._tile = None         # cache del patron de cuadros
 
     # --- API ---
     def set_images(self, img, img2=None):
+        """Establece la(s) imagen(es) a mostrar. Reajusta la vista si cambia el tamano."""
         cambio = self.img is None or self.img.size() != img.size()
         self.img, self.img2 = img, img2
         if cambio:
@@ -250,10 +370,16 @@ class ImageView(QWidget):
             self.update()
 
     def set_fondo(self, nombre):
+        """Cambia el fondo detras de la imagen (Cuadros, Negro, Gris, Blanco)."""
         self.fondo = nombre
         self.update()
 
     def ajustar(self):
+        """Ajusta zoom y posicion para que la imagen quepa centrada en la vista.
+
+        Si se puede ampliar (zoom >= 1) usa zoom entero para que el pixel art se
+        vea nitido, sin remuestreo irregular.
+        """
         if self.img is None:
             return
         iw, ih = self.img.width(), self.img.height()
@@ -267,17 +393,21 @@ class ImageView(QWidget):
 
     # --- coordenadas ---
     def _i2v(self, x, y):
+        """Imagen -> vista."""
         return QPointF(self.off.x() + x * self.zoom, self.off.y() + y * self.zoom)
 
     def _v2i(self, pos):
+        """Vista -> imagen."""
         return QPointF((pos.x() - self.off.x()) / self.zoom,
                        (pos.y() - self.off.y()) / self.zoom)
 
     def _rect_img(self):
+        """Rectangulo que ocupa la imagen en coordenadas de vista."""
         return QRectF(self.off.x(), self.off.y(),
                       self.img.width() * self.zoom, self.img.height() * self.zoom)
 
     def _hit_punto(self, pos):
+        """Indice del punto del warp bajo 'pos' (radio ~14 px de la vista), o None."""
         if not self.puntos:
             return None
         mejor, dmin = None, 14
@@ -289,6 +419,7 @@ class ImageView(QWidget):
 
     # --- dibujo ---
     def _pincel_cuadros(self):
+        """Pincel con el patron de cuadros de transparencia (se crea una sola vez)."""
         if self._tile is None:
             pm = QPixmap(16, 16)
             pm.fill(QColor(92, 92, 92))
@@ -307,16 +438,18 @@ class ImageView(QWidget):
             p.drawText(self.rect(), Qt.AlignCenter, self.mensaje)
             return
         r = self._rect_img()
-        vis = r.intersected(QRectF(self.rect()))
+        vis = r.intersected(QRectF(self.rect()))   # solo se pinta la parte visible
         if vis.isEmpty():
             return
         if self.fondo == "Cuadros":
             p.fillRect(vis, self._pincel_cuadros())
         else:
             p.fillRect(vis, self.FONDOS.get(self.fondo, QColor(0, 0, 0)))
+        # Sin suavizado: al ampliar, los pixeles se ven como bloques (util en pixel art).
         p.setRenderHint(QPainter.SmoothPixmapTransform, False)
 
         if self.comparar and self.img2 is not None:
+            # Izquierda del divisor: img; derecha: img2 (se recorta con setClipRect).
             sx = r.left() + r.width() * self.split
             p.save()
             p.setClipRect(QRectF(r.left(), r.top(), max(sx - r.left(), 0), r.height()))
@@ -326,6 +459,7 @@ class ImageView(QWidget):
             p.setClipRect(QRectF(sx, r.top(), max(r.right() - sx, 0) + 1, r.height()))
             p.drawImage(r, self.img2)
             p.restore()
+            # Linea del divisor (contorno oscuro + linea blanca) y su manija circular.
             p.setPen(QPen(QColor(0, 0, 0, 200), 3))
             p.drawLine(QPointF(sx, r.top()), QPointF(sx, r.bottom()))
             p.setPen(QPen(QColor(255, 255, 255), 1))
@@ -345,7 +479,7 @@ class ImageView(QWidget):
         # cuadrilatero y puntos del warp
         if self.puntos:
             p.setRenderHint(QPainter.Antialiasing, True)
-            orden = [0, 1, 3, 2]
+            orden = [0, 1, 3, 2]   # TL, TR, BR, BL: orden perimetral del poligono
             poly = QPolygonF([self._i2v(*self.puntos[i]) for i in orden])
             p.setPen(QPen(QColor(255, 220, 0, 220), 1.5))
             p.setBrush(QColor(255, 220, 0, 25))
@@ -364,6 +498,7 @@ class ImageView(QWidget):
             self.ajustar()
 
     def wheelEvent(self, e):
+        """Zoom hacia el cursor: el punto de la imagen bajo el mouse permanece fijo."""
         if self.img is None:
             return
         factor = 1.25 if e.angleDelta().y() > 0 else 1 / 1.25
@@ -375,12 +510,14 @@ class ImageView(QWidget):
         self.update()
 
     def _mover_split(self, pos):
+        """Mueve el divisor de comparacion a la posicion horizontal del mouse."""
         r = self._rect_img()
         if r.width() > 0:
             self.split = min(1.0, max(0.0, (pos.x() - r.left()) / r.width()))
             self.update()
 
     def mousePressEvent(self, e):
+        """Clic izquierdo: punto > divisor > pan. Clic derecho/central: pan."""
         if self.img is None:
             return
         pos = e.position()
@@ -406,6 +543,7 @@ class ImageView(QWidget):
         if self._drag:
             tipo = self._drag[0]
             if tipo == "punto":
+                # Los puntos se limitan a los bordes de la imagen.
                 x = min(max(ip.x(), 0), self.img.width() - 1)
                 y = min(max(ip.y(), 0), self.img.height() - 1)
                 self.puntoMovido.emit(self._drag[1], x, y)
@@ -417,6 +555,7 @@ class ImageView(QWidget):
                 self.auto_fit = False
                 self.update()
         else:
+            # Cursor contextual segun lo que haya bajo el mouse.
             if self._hit_punto(pos) is not None:
                 self.setCursor(Qt.SizeAllCursor)
             elif self.comparar:
@@ -434,7 +573,15 @@ class ImageView(QWidget):
 # Controles auxiliares
 # ----------------------------------------------------------------------------
 class SliderConValor(QWidget):
+    """Slider horizontal con una etiqueta que muestra su valor formateado."""
+
     def __init__(self, minimo, maximo, valor, formato=lambda v: str(v)):
+        """
+        Args:
+            minimo, maximo, valor: rango y valor inicial (enteros).
+            formato: funcion que convierte el valor entero al texto mostrado
+                     (p. ej. dividir entre 10 para mostrar decimales).
+        """
         super().__init__()
         self.formato = formato
         self.slider = QSlider(Qt.Horizontal)
@@ -459,28 +606,38 @@ class SliderConValor(QWidget):
 # Ventana principal
 # ----------------------------------------------------------------------------
 class Ventana(QMainWindow):
+    """Ventana principal: panel de controles, vista original y vista de resultado.
+
+    Flujo de datos:
+        original (BGRA) --aplicar_warp--> warp --crear_mapa_normales--> normal
+    Cada cambio de un control llama a procesar(), que recalcula warp y normal y
+    refresca las vistas. El estado completo de los controles se serializa en un
+    diccionario (estado()/aplicar_estado()) que alimenta deshacer/rehacer, los
+    presets y la restauracion de la sesion anterior.
+    """
     MODOS = ["Imagen", "Normales", "Comparar", "Luz"]
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Zomboid Asset Warper + Normal Map")
         self.resize(1400, 800)
-        self.setAcceptDrops(True)
+        self.setAcceptDrops(True)   # permite arrastrar una imagen a la ventana
         for n in ("logo.ico", "logo.png"):
             if os.path.exists(ruta_recurso(n)):
                 self.setWindowIcon(QIcon(ruta_recurso(n)))
                 break
 
-        self.cfg = QSettings()
+        self.cfg = QSettings()     # ajustes persistentes (geometria, tema, ultima sesion)
         self.ruta = None
         self.original = None   # BGRA
         self.warp = None       # BGRA
         self.normal = None     # BGRA
         self.modo = 0
-        self._luz = None
-        self._bloq = False
+        self._luz = None       # posicion de la luz en el modo "Luz"
+        self._bloq = False     # True = ignorar cambios de controles (carga programatica)
 
-        # deshacer / rehacer
+        # deshacer / rehacer: pilas de estados; el "commit" se retrasa 450 ms para
+        # agrupar cambios continuos (p. ej. arrastrar un slider) en un solo paso.
         self._undo, self._redo = [], []
         self._timer_commit = QTimer(self)
         self._timer_commit.setSingleShot(True)
@@ -495,6 +652,7 @@ class Ventana(QMainWindow):
 
     # ======================= construccion =======================
     def _construir_ui(self):
+        """Crea todos los widgets: panel lateral, vistas y conexiones de senales."""
         # --- panel de controles (con scroll) ---
         panel = QWidget()
         pl = QVBoxLayout(panel)
@@ -533,7 +691,7 @@ class Ventana(QMainWindow):
         self.chk_warp = QCheckBox("Aplicar warp")
         self.chk_warp.setChecked(True)
         f.addRow(self.chk_warp)
-        self.sp_src = []
+        self.sp_src = []   # [(spin_x, spin_y)] para cada uno de los 4 puntos
         for nombre, (x, y) in zip(POINT_NAMES, DEFAULT_SRC):
             sx, sy = QSpinBox(), QSpinBox()
             for s in (sx, sy):
@@ -593,7 +751,7 @@ class Ventana(QMainWindow):
         f3.addRow(QLabel("(modo Luz: mueve el mouse sobre la imagen)"))
         pl.addWidget(g_luz)
 
-        # Guardar
+        # Guardar (deshabilitados hasta que haya un resultado)
         self.btn_guardar = QPushButton("Guardar ambos (imagen + normales)...")
         self.btn_guardar.clicked.connect(self.guardar_ambos)
         self.btn_guardar_n = QPushButton("Guardar solo normales...")
@@ -663,7 +821,7 @@ class Ventana(QMainWindow):
         raiz.addWidget(split, 1)
         self.setCentralWidget(central)
 
-        # cualquier cambio de ajuste
+        # cualquier cambio de ajuste -> _cambio (reprocesa y programa el commit de deshacer)
         for sp in [self.sp_w, self.sp_h] + [s for par in self.sp_src for s in par]:
             sp.valueChanged.connect(self._cambio)
         self.chk_warp.toggled.connect(self._cambio)
@@ -673,9 +831,11 @@ class Ventana(QMainWindow):
             s.slider.valueChanged.connect(self._cambio)
         for c in (self.c_invert, self.c_flip, self.c_flat):
             c.toggled.connect(self._cambio)
+        # La altura de la luz solo afecta a la vista, no al resultado guardado.
         self.s_luz.slider.valueChanged.connect(lambda _: self.refrescar_resultado())
 
     def _construir_menus(self):
+        """Crea la barra de menus (Archivo, Edicion, Vista, Ayuda) con sus atajos."""
         mb = self.menuBar()
         m_arch = mb.addMenu("&Archivo")
         self._accion(m_arch, "Abrir imagen...", "Ctrl+O", self.abrir)
@@ -715,6 +875,7 @@ class Ventana(QMainWindow):
         self._accion(m_ayuda, "Atajos y controles", "F1", self.mostrar_ayuda)
 
     def _accion(self, menu, texto, atajo, slot):
+        """Crea una QAction con atajo opcional, la agrega al menu y la devuelve."""
         a = QAction(texto, self)
         if atajo:
             a.setShortcut(QKeySequence(atajo))
@@ -723,10 +884,12 @@ class Ventana(QMainWindow):
         return a
 
     def _estado_msg(self, texto):
+        """Muestra un mensaje en la barra de estado."""
         self.statusBar().showMessage(texto)
 
     # ======================= ajustes persistentes =======================
     def _cargar_ajustes(self):
+        """Restaura geometria, tema, fondo y los ultimos ajustes usados (QSettings)."""
         geo = self.cfg.value("geometry")
         if geo is not None:
             self.restoreGeometry(geo)
@@ -740,9 +903,10 @@ class Ventana(QMainWindow):
             e = json.loads(self.cfg.value("estado", ""))
             self.aplicar_estado(e, push=False)
         except Exception:
-            pass
+            pass   # primera ejecucion o ajustes corruptos: se usan los valores por defecto
 
     def closeEvent(self, ev):
+        """Guarda la configuracion al cerrar la ventana."""
         self.cfg.setValue("geometry", self.saveGeometry())
         self.cfg.setValue("estado", json.dumps(self.estado()))
         self.cfg.setValue("oscuro", self.act_tema.isChecked())
@@ -760,6 +924,7 @@ class Ventana(QMainWindow):
 
     # ======================= estado, deshacer, presets =======================
     def estado(self):
+        """Devuelve un diccionario con el valor actual de todos los controles."""
         return {
             "warp": self.chk_warp.isChecked(),
             "puntos": [[sx.value(), sy.value()] for sx, sy in self.sp_src],
@@ -775,6 +940,14 @@ class Ventana(QMainWindow):
         }
 
     def aplicar_estado(self, e, push=True):
+        """Pone los controles segun el diccionario 'e' y reprocesa la imagen.
+
+        Las claves que falten se completan con DEFAULT_ESTADO. Mientras se
+        escriben los controles, _bloq evita que cada cambio dispare un reproceso.
+
+        Args:
+            push: True = registrar el cambio en el historial de deshacer.
+        """
         d = dict(DEFAULT_ESTADO)
         d.update(e)
         self._bloq = True
@@ -799,12 +972,14 @@ class Ventana(QMainWindow):
             self._ultimo = self.estado()
 
     def _cambio(self, *_):
+        """Reacciona a un cambio de control: reprocesa y programa el commit al historial."""
         if self._bloq:
             return
         self.procesar()
         self._timer_commit.start(450)
 
     def _commit(self):
+        """Guarda el estado anterior en la pila de deshacer si algo cambio (max. 100)."""
         self._timer_commit.stop()
         e = self.estado()
         if e != self._ultimo:
@@ -835,12 +1010,14 @@ class Ventana(QMainWindow):
         self._estado_msg("Rehacer")
 
     def restaurar_warp(self):
+        """Vuelve los ajustes del warp a sus valores por defecto."""
         e = self.estado()
         for k in ("warp", "puntos", "ancho", "alto", "tam_auto"):
             e[k] = DEFAULT_ESTADO[k]
         self.aplicar_estado(e)
 
     def restaurar_normales(self):
+        """Vuelve los ajustes del mapa de normales a sus valores por defecto."""
         e = self.estado()
         for k in CLAVES_NORMALES:
             e[k] = DEFAULT_ESTADO[k]
@@ -848,6 +1025,7 @@ class Ventana(QMainWindow):
 
     # --- presets ---
     def _dir_config(self):
+        """Carpeta de configuracion de la aplicacion (se crea si no existe)."""
         d = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
         os.makedirs(d, exist_ok=True)
         return d
@@ -856,6 +1034,7 @@ class Ventana(QMainWindow):
         return os.path.join(self._dir_config(), "presets.json")
 
     def _cargar_presets(self):
+        """Lee presets.json; si no existe o es invalido, devuelve un preset por defecto."""
         try:
             with open(self._ruta_presets(), "r", encoding="utf-8") as f:
                 datos = json.load(f)
@@ -873,6 +1052,7 @@ class Ventana(QMainWindow):
             QMessageBox.warning(self, "Presets", "No se pudo guardar el archivo de presets:\n%s" % e)
 
     def _refrescar_combo_presets(self, seleccionar=None):
+        """Rellena el combo de presets (orden alfabetico) sin disparar sus senales."""
         self.cmb_preset.blockSignals(True)
         self.cmb_preset.clear()
         for n in sorted(self.presets, key=str.lower):
@@ -884,6 +1064,8 @@ class Ventana(QMainWindow):
         self.cmb_preset.blockSignals(False)
 
     def aplicar_preset(self, idx):
+        """Aplica el preset elegido. Si 'Incluir el warp' esta apagado, solo se
+        aplican los ajustes de normales y se conserva el warp actual."""
         nombre = self.cmb_preset.itemText(idx)
         p = self.presets.get(nombre)
         if not p:
@@ -899,6 +1081,7 @@ class Ventana(QMainWindow):
         self._estado_msg("Preset aplicado: " + nombre)
 
     def guardar_preset(self):
+        """Pide un nombre y guarda el estado actual como preset (confirma si reemplaza)."""
         nombre, ok = QInputDialog.getText(self, "Guardar preset", "Nombre del preset:",
                                           text=self.cmb_preset.currentText())
         nombre = nombre.strip()
@@ -915,6 +1098,7 @@ class Ventana(QMainWindow):
         self._estado_msg("Preset guardado: " + nombre)
 
     def eliminar_preset(self):
+        """Elimina el preset seleccionado tras confirmar."""
         nombre = self.cmb_preset.currentText()
         if not nombre or nombre not in self.presets:
             return
@@ -928,6 +1112,7 @@ class Ventana(QMainWindow):
 
     # ======================= abrir =======================
     def abrir(self):
+        """Abre un dialogo para elegir una imagen (recuerda la ultima carpeta)."""
         ini = self.cfg.value("dir_abrir", "")
         ruta, _ = QFileDialog.getOpenFileName(
             self, "Abrir imagen", ini if isinstance(ini, str) else "",
@@ -936,6 +1121,7 @@ class Ventana(QMainWindow):
             self.cargar(ruta)
 
     def cargar(self, ruta):
+        """Carga la imagen, la muestra en la vista original y genera el resultado."""
         try:
             img = leer_imagen(ruta)
         except Exception as e:
@@ -957,6 +1143,7 @@ class Ventana(QMainWindow):
             e.acceptProposedAction()
 
     def dropEvent(self, e):
+        """Carga la primera imagen soltada sobre la ventana."""
         rutas = [u.toLocalFile() for u in e.mimeData().urls() if os.path.isfile(u.toLocalFile())]
         if rutas:
             self.cargar(rutas[0])
@@ -965,9 +1152,15 @@ class Ventana(QMainWindow):
 
     # ======================= procesar y vistas =======================
     def puntos_src(self):
+        """Los 4 puntos del warp actuales, leidos de los spinboxes."""
         return [(sx.value(), sy.value()) for sx, sy in self.sp_src]
 
     def _punto_arrastrado(self, i, x, y):
+        """Actualiza los spinboxes del punto i al arrastrarlo en la vista.
+
+        Se bloquean sus senales para reprocesar una sola vez (con _cambio) en lugar
+        de una por cada spinbox modificado.
+        """
         sx, sy = self.sp_src[i]
         sx.blockSignals(True); sy.blockSignals(True)
         sx.setValue(int(round(x))); sy.setValue(int(round(y)))
@@ -981,6 +1174,7 @@ class Ventana(QMainWindow):
         return self.sp_w.value(), self.sp_h.value()
 
     def _actualizar_tam_ui(self, *_):
+        """Habilita/deshabilita los spinboxes de tamano y muestra el tamano calculado."""
         auto = self.chk_tam_auto.isChecked()
         self.sp_w.setEnabled(not auto)
         self.sp_h.setEnabled(not auto)
@@ -991,6 +1185,7 @@ class Ventana(QMainWindow):
             self.lbl_tam_auto.setText("")
 
     def procesar(self, *_):
+        """Recalcula warp y mapa de normales con los ajustes actuales y refresca las vistas."""
         self.v_orig.puntos = self.puntos_src() if self.chk_warp.isChecked() else None
         self.v_orig.update()
         self._actualizar_tam_ui()
@@ -1013,17 +1208,20 @@ class Ventana(QMainWindow):
         except Exception as e:
             self._estado_msg("Error: %s" % e)
             return
+        # Con un resultado disponible se habilitan los botones y acciones de guardado.
         for w in (self.btn_guardar, self.btn_guardar_n, self.btn_guardar_w,
                   self.act_guardar, self.act_guardar_n, self.act_guardar_w):
             w.setEnabled(True)
         self.refrescar_resultado()
 
     def set_modo(self, i):
+        """Cambia el modo de la vista de resultado (Imagen, Normales, Comparar, Luz)."""
         self.modo = i
         self.v_res.comparar = (i == 2)
         self.refrescar_resultado()
 
     def refrescar_resultado(self):
+        """Actualiza la vista de resultado segun el modo activo."""
         if self.warp is None or self.normal is None:
             return
         m = self.modo
@@ -1038,13 +1236,14 @@ class Ventana(QMainWindow):
         else:
             h, w = self.warp.shape[:2]
             if self._luz is None:
-                self._luz = (w * 0.25, h * 0.25)
+                self._luz = (w * 0.25, h * 0.25)   # posicion inicial de la luz
             lit = iluminar(self.warp, self.normal, self.c_flip.isChecked(),
                            self._luz, self.s_luz.value() / 10.0)
             self.v_res.set_images(bgra_a_qimage(lit))
         self.v_res.update()
 
     def _hover_resultado(self, x, y):
+        """En modo Luz, la luz sigue al mouse sobre la imagen de resultado."""
         if self.modo == 3 and self.warp is not None:
             self._luz = (x, y)
             self.refrescar_resultado()
@@ -1055,16 +1254,19 @@ class Ventana(QMainWindow):
 
     # ======================= guardar =======================
     def _nombre_sugerido(self):
+        """Nombre base sugerido: <nombre de la imagen>_Wall."""
         base = os.path.splitext(os.path.basename(self.ruta or "imagen"))[0]
         return base + "_Wall"
 
     def _carpeta_guardar(self):
+        """Carpeta inicial del dialogo de guardado: la ultima usada, o la de la imagen."""
         d = self.cfg.value("dir_guardar", "")
         if isinstance(d, str) and d and os.path.isdir(d):
             return d
         return os.path.dirname(self.ruta) if self.ruta else ""
 
     def _pedir_ruta(self, titulo, nombre):
+        """Dialogo 'Guardar como' para PNG. Devuelve la ruta (con .png) o None si se cancela."""
         ruta, _ = QFileDialog.getSaveFileName(
             self, titulo, os.path.join(self._carpeta_guardar(), nombre), "PNG (*.png)")
         if not ruta:
@@ -1075,6 +1277,7 @@ class Ventana(QMainWindow):
         return ruta
 
     def _escribir(self, ruta, img):
+        """Guarda la imagen mostrando un error si falla. Devuelve True si tuvo exito."""
         try:
             guardar_imagen(ruta, img)
             return True
@@ -1083,6 +1286,7 @@ class Ventana(QMainWindow):
             return False
 
     def guardar_ambos(self):
+        """Guarda NOMBRE.png (warp) y NOMBRE_n.png (normales) en la misma carpeta."""
         if self.warp is None:
             return
         ruta = self._pedir_ruta("Guardar imagen warpeada (las normales se guardan al lado como _n)",
@@ -1094,6 +1298,7 @@ class Ventana(QMainWindow):
             self._estado_msg("Guardado: %s  y  %s" % (ruta, ruta_n))
 
     def guardar_normales(self):
+        """Guarda solo el mapa de normales (sugiere el sufijo _n)."""
         if self.normal is None:
             return
         ruta = self._pedir_ruta("Guardar mapa de normales", self._nombre_sugerido() + "_n.png")
@@ -1101,6 +1306,7 @@ class Ventana(QMainWindow):
             self._estado_msg("Guardado: " + ruta)
 
     def guardar_warp(self):
+        """Guarda solo la imagen warpeada."""
         if self.warp is None:
             return
         ruta = self._pedir_ruta("Guardar imagen warpeada", self._nombre_sugerido() + ".png")
@@ -1109,6 +1315,7 @@ class Ventana(QMainWindow):
 
     # ======================= ayuda =======================
     def mostrar_ayuda(self):
+        """Muestra el cuadro con atajos de teclado y controles del mouse."""
         QMessageBox.information(self, "Atajos y controles", (
             "ATAJOS\n"
             "  Ctrl+O            Abrir imagen\n"
@@ -1132,6 +1339,8 @@ class Ventana(QMainWindow):
 
 
 def main():
+    """Punto de entrada: crea la aplicacion, abre la ventana y, si se paso una imagen
+    como argumento de linea de comandos, la carga."""
     app = QApplication(sys.argv)
     app.setOrganizationName("ZomboidTools")
     app.setApplicationName("ZomboidNormalMapper")

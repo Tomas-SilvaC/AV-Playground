@@ -1,10 +1,35 @@
+/**
+ * BoxFilter.cpp
+ * Filtro de caja (box filter) sobre una imagen en escala de grises.
+ *
+ * ## Idea general
+ * Filtrar una imagen es convolucionarla con un kernel: una matriz pequeña que se
+ * desliza sobre la imagen; en cada posición se multiplican los valores del kernel
+ * por los píxeles que cubre, se suman los resultados y el total reemplaza al píxel
+ * central.
+ *
+ * El filtro de caja es el kernel lineal de suavizado más simple: todos los pesos
+ * son iguales y suman 1, es decir cada elemento vale 1/(k*k). Equivale a reemplazar
+ * cada píxel por el PROMEDIO de su vecindario k x k:
+ *
+ *        | 1 1 1 |
+ *   1/9  | 1 1 1 |      (ejemplo con k = 3)
+ *        | 1 1 1 |
+ *
+ * Es un filtro espacial lineal (actúa directamente sobre la cuadrícula de píxeles).
+ *
+ * ## Uso
+ * Pide por consola la ruta de la imagen y el tamaño del kernel (impar, 5 por defecto).
+ * Muestra original, gris y filtrada, y guarda gris.jpg y filtro_caja.jpg.
+ */
+
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <string>
 
 int main() {
     std::string rutaImagen;
-    int kernelSize = 5;
+    int kernelSize = 5; // Tamaño del kernel predeterminado
 
     std::cout << "=== Filtro de Caja y Escala de Grises ===\n";
     std::cout << "Ingresa la ruta de la imagen: ";
@@ -15,6 +40,8 @@ int main() {
         rutaImagen = rutaImagen.substr(1, rutaImagen.size() - 2);
     }
 
+    // El kernel debe tener lado impar para tener un píxel central.
+    // Si el usuario ingresa un par, se suma 1; si es inválido, se usa el valor por defecto.
     std::cout << "Tamano del kernel (impar, Enter para usar 5 por defecto): ";
     std::string entradaKernel;
     std::getline(std::cin, entradaKernel);
@@ -46,10 +73,13 @@ int main() {
     }
 
     // 1) Convertir a escala de grises
+    //    (OpenCV carga en orden BGR; se reduce a un solo canal de intensidad).
     cv::Mat imagenGris;
     cv::cvtColor(imagenOriginal, imagenGris, cv::COLOR_BGR2GRAY);
 
     // 2) Aplicar filtro de caja sobre la version en grises
+    //    ddepth = -1 -> la salida conserva la profundidad de la entrada (8 bits).
+    //    Por defecto boxFilter normaliza (divide por k*k), es decir, promedia.
     cv::Mat imagenFiltrada;
     cv::boxFilter(imagenGris, imagenFiltrada, -1, cv::Size(kernelSize, kernelSize));
 
