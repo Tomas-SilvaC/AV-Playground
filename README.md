@@ -1,5 +1,5 @@
 # AV-Playground
-
+# Tomas Alejandro Silva Correal
 Playground general para los conceptos trabajados en la clase de **Visión Artificial 2026-3**.
 
 Cada programa es una implementación práctica y autocontenida de un tema visto en clase, escrita con **OpenCV** (mayormente en archivos CPP junto a un programa extra realizado en Python).
