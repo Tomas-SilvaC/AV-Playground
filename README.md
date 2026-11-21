@@ -199,6 +199,28 @@ python UI/launcher.py
 3. Lo **ejecuta** entregándole los datos como argumentos o por `stdin`. Sus ventanas de OpenCV se abren aparte y se cierran con `q` / `ESC`.
 4. Muestra la **consola**, los archivos que generó (pestaña *Resultados*; se guardan en `UI/salidas/<programa>/`) y el **código fuente** con colores.
 
+### Cómo ver un programa desde la UI (paso a paso)
+
+1. Abre la interfaz con `python UI/launcher.py`.
+2. En el árbol **Temas vistos** (izquierda) elige el programa. A la derecha aparecen su descripción y las teclas de sus ventanas.
+3. Completa los **Parámetros**. La imagen de ejemplo del repositorio ya viene cargada; usa *Examinar…* para elegir otra (se muestra una vista previa).
+4. Pulsa **▶ Ejecutar**. La primera vez compila el programa (verás el avance en la pestaña *Consola*); las siguientes veces corre directo.
+5. Se abre la **ventana de OpenCV** del programa, aparte de la interfaz: ahí se mueven sus barras y se usan sus teclas (`q` / `ESC` para cerrarla, `s` para guardar, según el programa).
+6. Al terminar, la pestaña **Resultados** lista las imágenes y archivos que generó (`calibration.yml`, `histogramas.png`, `out_*.png`...) y los muestra. La pestaña **Código fuente** deja leer el programa con colores mientras lo explicas.
+
+Botones útiles: **Compilar** (solo compila), **■ Detener** (cierra el programa en ejecución) y **Abrir carpeta de salidas** (abre `UI/salidas/<programa>/`).
+
+| Entrada del árbol | Parámetros | Qué verás |
+|---|---|---|
+| Calibración de cámara | Carpeta con fotos `.jpg` del tablero | Cada foto con sus esquinas (cualquier tecla = siguiente); en consola K, distorsión y error RMS; `calibration.yml` en *Resultados* |
+| Filtro de caja | Imagen y tamaño del kernel | Original, grises y filtrada; `gris.jpg` y `filtro_caja.jpg` |
+| Histogramas y ecualización | Imagen | Imágenes y histogramas (barras `Bins`, `Normalizar`, `Log`); tabla de frecuencias en consola |
+| Umbralización y binarización | Imagen | Global, Otsu, adaptativa y su histograma (barras `Umbral`, `Tipo`, `Bloque`, `C`) |
+| Erosión y dilatación | Imagen o webcam | Resultado en vivo (barras `Tamano`, `Forma`, `Binaria`, `Umbral`) |
+| Transformada de Fourier | Imagen | Imagen y espectro de magnitud |
+| CNN y Vision Transformer | Imagen, tamaño de parche y k | Paneles del ViT, atención, segmentación y mapas de la CNN (`out_*.png`) |
+| Caracterización de imágenes | Imagen y modo inicial | Cuatro modos (barra `Modo`): intensidad, objetos, textura y puntos clave; `p` imprime el reporte en consola |
+
 **Archivos:**
 
 | Archivo | Función |
